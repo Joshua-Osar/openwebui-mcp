@@ -1,8 +1,7 @@
 import express from "express";
 import { z } from "zod";
-
-const app = express();
-app.use(express.json());
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
 const PORT = process.env.PORT || 3000;
 const OPENWEBUI_BASE_URL = process.env.OPENWEBUI_BASE_URL;
@@ -35,84 +34,74 @@ async function callOpenWebUI(path, body) {
   return await res.json();
 }
 
-app.get("/", (_req, res) => {
-  res.send("OpenWebUI MCP server is running.");
+const mcpServer = new McpServer({
+  name: "openwebui-mcp",
+  version: "1.0.0"
 });
 
-/*
-  Very simple MCP-like endpoints for testing.
-  In production, use a fuller MCP server implementation/transport.
-*/
-
-app.get("/sse", (_req, res) => {
-  res.status(200).set({
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    "Connection": "keep-alive"
-  });
-
-  res.write(`event: message\n`);
-  res.write(`data: {"status":"connected"}\n\n`);
-});
-
-app.post("/tools/list", (_req, res) => {
-  res.json({
-    tools: [
-      {
-        name: "chat_completion",
-        description: "Send a chat request to Open WebUI and return the answer.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            model: { type: "string" },
-            prompt: { type: "string" }
-          },
-          required: ["model", "prompt"]
-        }
-      }
-    ]
-  });
-});
-
-app.post("/tools/call", async (req, res) => {
-  try {
-    const schema = z.object({
-      name: z.string(),
-      arguments: z.object({
-        model: z.string(),
-        prompt: z.string()
-      })
-    });
-
-    const parsed = schema.parse(req.body);
-
-    if (parsed.name !== "chat_completion") {
-      return res.status(400).json({ error: "Unknown tool" });
+mcpServer.registerTool(
+  "chat_completion",
+  {
+    title: "Chat Completion",
+    description: "Send a prompt to Open WebUI and return the assistant response.",
+    inputSchema: {
+      model: z.string().describe("The model name to use in Open WebUI"),
+      prompt: z.string().describe("The user prompt to send")
     }
-
+  },
+  async ({ model, prompt }) => {
     const result = await callOpenWebUI("/api/chat/completions", {
-      model: parsed.arguments.model,
-      messages: [
-        { role: "user", content: parsed.arguments.prompt }
-      ]
+      model,
+      messages: [{ role: "user", content: prompt }]
     });
 
     const text =
-      result?.choices?.[0]?.message?.content ||
+      result?.choices?.[0]?.message?.content ??
       JSON.stringify(result);
 
-    res.json({
+    return {
       content: [
         {
           type: "text",
           text
         }
       ]
+    };
+  }
+);
+
+const app = express();
+app.use(express.json());
+
+app.get("/", (_req, res) => {
+  res.send("OpenWebUI MCP server is running.");
+});
+
+// Optional health check
+app.get("/health", (_req, res) => {
+  res.json({ ok: true });
+});
+
+// MCP endpoint for ChatGPT
+app.all("/mcp", async (req, res) => {
+  try {
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined
     });
-  } catch (err) {
-    res.status(500).json({
-      error: err.message || "Unknown error"
+
+    res.on("close", () => {
+      transport.close();
     });
+
+    await mcpServer.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (error) {
+    console.error("MCP transport error:", error);
+    if (!res.headersSent) {
+      res.status(500).json({
+        error: error?.message || "Internal server error"
+      });
+    }
   }
 });
 
